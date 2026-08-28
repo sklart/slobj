@@ -42,6 +42,25 @@ public final class Slob extends AbstractList<Slob.Blob> {
         byte[] decompress(byte[] input) throws IOException;
     }
 
+    /** Raised when a file declares a compression method this reader cannot handle. */
+    public final static class UnknownCompressionException extends IOException {
+        UnknownCompressionException(String compression) {
+            super("Unsupported compression: " + compression);
+        }
+    }
+
+    /** Raised for a structurally invalid SLOB instead of leaking buffer/index errors. */
+    public final static class InvalidSlobException extends IOException {
+        InvalidSlobException(String message) {
+            super(message);
+        }
+    }
+
+    private static final int DECOMPRESSION_BUFFER_SIZE = 64 * 1024;
+    private static final long DEFAULT_MAX_DECOMPRESSED_BIN_SIZE = 64L * 1024L * 1024L;
+    private static final long MAX_DECOMPRESSED_BIN_SIZE = Long.getLong(
+            "itkach.slob.maxDecompressedBinSize", DEFAULT_MAX_DECOMPRESSED_BIN_SIZE);
+
     static Map<String, Compressor> COMPRESSORS = new HashMap<>();
 
     static public void register(String name, Compressor compressor) {
@@ -58,28 +77,35 @@ public final class Slob extends AbstractList<Slob.Blob> {
     }
 
     static {
+        register("", new Compressor() {
+            @Override
+            public byte[] decompress(byte[] input) {
+                return input;
+            }
+        });
+
         register("lzma2", new Compressor(){
 
             LZMA2Options lzma2 = new LZMA2Options();
 
             @Override
             public byte[] decompress(byte[] input) throws IOException {
-                ByteArrayInputStream is = new ByteArrayInputStream(input);
-                InputStream lis = lzma2.getInputStream(is);
                 ByteArrayOutputStream out = new ByteArrayOutputStream();
-                while (true) {
-                    byte[] buf = new byte[input.length*8];
-                    int count = lis.read(buf);
-                    if (count < 0) {
-                        break;
+                InputStream lis = null;
+                try {
+                    lis = lzma2.getInputStream(new ByteArrayInputStream(input));
+                    byte[] buf = new byte[DECOMPRESSION_BUFFER_SIZE];
+                    int count;
+                    while ((count = lis.read(buf)) != -1) {
+                        writeDecompressed(out, buf, count);
                     }
-                    out.write(buf, 0, count);
+                    return out.toByteArray();
+                } finally {
+                    if (lis != null) {
+                        lis.close();
+                    }
+                    out.close();
                 }
-                byte[] result = out.toByteArray();
-                is.close();
-                lis.close();
-                out.close();
-                return result;
             }
         });
 
@@ -91,23 +117,39 @@ public final class Slob extends AbstractList<Slob.Blob> {
                 decompressor.setInput(input);
                 ByteArrayOutputStream out = new ByteArrayOutputStream();
                 try {
-                    byte[] buf = new byte[input.length*4];
+                    byte[] buf = new byte[DECOMPRESSION_BUFFER_SIZE];
                     while (!decompressor.finished()) {
                         int count;
                         try {
                             count = decompressor.inflate(buf);
                         } catch (DataFormatException e) {
-                            throw new IOException(e);
+                            throw new InvalidSlobException("Invalid zlib stream: " + e.getMessage());
                         }
-                        out.write(buf, 0, count);
+                        if (count == 0) {
+                            if (decompressor.needsInput() || decompressor.needsDictionary()) {
+                                throw new InvalidSlobException("Truncated or unsupported zlib stream");
+                            }
+                            throw new InvalidSlobException("zlib decompressor made no progress");
+                        }
+                        writeDecompressed(out, buf, count);
                     }
+                    return out.toByteArray();
                 }
                 finally {
+                    decompressor.end();
                     out.close();
                 }
-                return out.toByteArray();
             }
         });
+    }
+
+    private static void writeDecompressed(ByteArrayOutputStream out, byte[] data, int count)
+            throws InvalidSlobException {
+        if (count < 0 || out.size() > MAX_DECOMPRESSED_BIN_SIZE - count) {
+            throw new InvalidSlobException("Decompressed bin exceeds safety limit of "
+                    + MAX_DECOMPRESSED_BIN_SIZE + " bytes");
+        }
+        out.write(data, 0, count);
     }
 
     static int toUnsignedByte(byte b) {
@@ -260,34 +302,58 @@ public final class Slob extends AbstractList<Slob.Blob> {
         }
 
         public int read(byte[] data, long position) throws IOException {
-            return c.read(ByteBuffer.wrap(data), position);
+            ByteBuffer buffer = ByteBuffer.wrap(data);
+            readFully(buffer, position);
+            return data.length;
         }
 
         public long length() throws IOException {
             return c.size();
         }
 
+        private void checkRange(long position, long length) throws IOException {
+            if (position < 0 || length < 0 || position > c.size() || length > c.size() - position) {
+                throw new TruncatedFileException();
+            }
+        }
+
+        /** FileChannel is allowed to return a partial read even for a positional read. */
+        void readFully(ByteBuffer buffer, long position) throws IOException {
+            checkRange(position, buffer.remaining());
+            long readPosition = position;
+            while (buffer.hasRemaining()) {
+                int count = c.read(buffer, readPosition);
+                if (count < 0) {
+                    throw new TruncatedFileException();
+                }
+                if (count == 0) {
+                    throw new IOException("File channel made no progress while reading SLOB");
+                }
+                readPosition += count;
+            }
+        }
+
         int readUnsignedByte(long position) throws IOException {
             ByteBuffer bb = ByteBuffer.allocate(1);
-            c.read(bb, position);
+            readFully(bb, position);
             return toUnsignedByte(bb.get(0));
         }
 
         int readUnsignedShort(long position) throws IOException {
             ByteBuffer bb = ByteBuffer.allocate(2);
-            c.read(bb, position);
+            readFully(bb, position);
             return toUnsignedShort(bb.array());
         }
 
         long readLong(long position) throws IOException {
             ByteBuffer bb = ByteBuffer.allocate(8);
-            c.read(bb, position);
+            readFully(bb, position);
             return bb.getLong(0);
         }
 
         long readUnsignedInt(long position) throws IOException {
             ByteBuffer bb = ByteBuffer.allocate(4);
-            c.read(bb, position);
+            readFully(bb, position);
             return toUnsignedInt(bb.array(), 0);
         }
 
@@ -458,7 +524,12 @@ public final class Slob extends AbstractList<Slob.Blob> {
         pos += countSize.byteSize;
         long posOffset = pos;
         SizeType posSize = offsetSize;
-        long dataOffset = posOffset + posSize.byteSize*count;
+        if (count > Integer.MAX_VALUE) {
+            throw new InvalidSlobException("Item count exceeds Java list limit: " + count);
+        }
+        long pointerBytes = checkedMultiply(posSize.byteSize, count, "item-list pointer table");
+        long dataOffset = checkedAdd(posOffset, pointerBytes, "item-list data offset");
+        f.checkRange(offset, dataOffset - offset);
         return new ItemListInfo(count, posOffset, dataOffset, posSize);
     }
 
@@ -482,14 +553,18 @@ public final class Slob extends AbstractList<Slob.Blob> {
         }
 
         private long readPointer(long i) throws IOException {
-            long pos = this.posOffset + this.posSize.byteSize*i;
+            if (i < 0 || i >= count) {
+                throw new InvalidSlobException("Item index out of range: " + i);
+            }
+            long pos = checkedAdd(this.posOffset,
+                    checkedMultiply(this.posSize.byteSize, i, "item pointer"), "item pointer offset");
             return this.posSize.read(this.file, pos);
         }
 
         protected abstract T readItem(long position) throws IOException;
 
         private T read(long pointer) throws IOException {
-            return this.readItem(this.dataOffset + pointer);
+            return this.readItem(checkedAdd(this.dataOffset, pointer, "item data offset"));
         }
 
         public int size() {
@@ -497,6 +572,9 @@ public final class Slob extends AbstractList<Slob.Blob> {
         }
 
         public T get(int i) {
+            if (i < 0 || i >= count) {
+                throw new IndexOutOfBoundsException("Item index out of range: " + i);
+            }
             T item = cache.get(i);
             if (item != null) {
                 return item;
@@ -573,6 +651,9 @@ public final class Slob extends AbstractList<Slob.Blob> {
         private final int dataOffset;
 
         public Bin(byte[] binBytes, int count) {
+            if (count < 0 || (long) count * SIZE_UINT > binBytes.length) {
+                throw new IllegalArgumentException("Invalid bin item table");
+            }
             this.binBytes = binBytes;
             this.count = count;
             this.posOffset = 0;
@@ -580,13 +661,22 @@ public final class Slob extends AbstractList<Slob.Blob> {
         }
 
         protected ByteBuffer readItem(int offset) throws IOException {
+            if (offset < dataOffset || offset > binBytes.length - SIZE_UINT) {
+                throw new InvalidSlobException("Invalid bin item offset");
+            }
             int contentLength = (int)toUnsignedInt(this.binBytes, offset);
+            if (contentLength < 0 || contentLength > binBytes.length - offset - SIZE_UINT) {
+                throw new InvalidSlobException("Invalid bin item length");
+            }
             return ByteBuffer
                     .wrap(this.binBytes, offset + 4, contentLength)
                     .asReadOnlyBuffer();
         }
 
         protected int readPointer(int i) throws IOException {
+            if (i < 0 || i >= count) {
+                throw new InvalidSlobException("Bin item index out of range: " + i);
+            }
             return (int)toUnsignedInt(this.binBytes, this.posOffset + 4*i);
         }
 
@@ -620,14 +710,21 @@ public final class Slob extends AbstractList<Slob.Blob> {
             this.compressedContent = compressedContent;
         }
 
-        private ByteBuffer getBinItem(int itemIndex, Compressor compressor) throws IOException {
+        private synchronized ByteBuffer getBinItem(int itemIndex, Compressor compressor) throws IOException {
+            if (itemIndex < 0 || itemIndex >= contentTypeIds.length) {
+                throw new InvalidSlobException("Bin item index out of range: " + itemIndex);
+            }
             if (bin == null) {
                 long t0 = System.currentTimeMillis();
                 byte[] decompressed = compressor.decompress(this.compressedContent);
                 this.compressedContent = null;
                 L.fine("decompressed content in " + (System.currentTimeMillis() - t0));
                 L.fine("decompressed length: " + decompressed.length);
-                bin = new Bin(decompressed, this.contentTypeIds.length);
+                try {
+                    bin = new Bin(decompressed, this.contentTypeIds.length);
+                } catch (IllegalArgumentException e) {
+                    throw new InvalidSlobException(e.getMessage());
+                }
             }
             return bin.get(itemIndex);
         }
@@ -657,13 +754,25 @@ public final class Slob extends AbstractList<Slob.Blob> {
             long binItemCount = file.readUnsignedInt(position);
             position += SIZE_UINT;
 
+            if (binItemCount > Integer.MAX_VALUE) {
+                throw new InvalidSlobException("Bin item count exceeds Java array limit: " + binItemCount);
+            }
+            file.checkRange(pos, checkedAdd(SIZE_UINT, binItemCount, "bin header"));
+
             int[] contentTypeIds = new int[(int)binItemCount];
             for (int i = 0; i < binItemCount; i++) {
                 contentTypeIds[i] = file.readUnsignedByte(position);
+                if (contentTypeIds[i] >= contentTypes.size()) {
+                    throw new InvalidSlobException("Invalid content type index: " + contentTypeIds[i]);
+                }
                 position += SIZE_UBYTE;
             }
             long compressedLength = file.readUnsignedInt(position);
             position += SIZE_UINT;
+            if (compressedLength > Integer.MAX_VALUE) {
+                throw new InvalidSlobException("Compressed bin exceeds Java array limit: " + compressedLength);
+            }
+            file.checkRange(position, compressedLength);
             L.fine("Compressed length: " + compressedLength);
             byte[] compressed = new byte[(int)compressedLength];
             file.read(compressed, position);
@@ -673,6 +782,9 @@ public final class Slob extends AbstractList<Slob.Blob> {
 
         String getContentType(int binIndex, int itemIndex) {
             StoreItem storeItem = get(binIndex);
+            if (itemIndex < 0 || itemIndex >= storeItem.contentTypeIds.length) {
+                throw new IndexOutOfBoundsException("Bin item index out of range: " + itemIndex);
+            }
             return contentTypes.get(storeItem.contentTypeIds[itemIndex]);
         }
 
@@ -747,11 +859,19 @@ public final class Slob extends AbstractList<Slob.Blob> {
         if (this.header.size != f.length()) {
             throw new TruncatedFileException();
         }
+        if (this.header.storeOffset < 0 || this.header.refsOffset < 0
+                || this.header.storeOffset >= this.header.size || this.header.refsOffset >= this.header.size) {
+            throw new InvalidSlobException("Invalid store or refs offset");
+        }
+        Compressor compressor = COMPRESSORS.get(header.compression);
+        if (compressor == null) {
+            throw new UnknownCompressionException(header.compression);
+        }
         ItemListInfo refListInfo = readItemListInfo(f, this.header.refsOffset, SizeType.UINT, SizeType.ULONG);
         ItemListInfo storeListInfo = readItemListInfo(f, this.header.storeOffset, SizeType.UINT, SizeType.ULONG);
 
         this.store = new Store(
-                f, COMPRESSORS.get(header.compression),
+                f, compressor,
                 header.contentTypes,
                 storeListInfo,
                 storeCache);
@@ -775,6 +895,20 @@ public final class Slob extends AbstractList<Slob.Blob> {
     final static int SIZE_ULONG = 8;
     final static int SIZE_MAGIC = 8;
     final static int SIZE_UUID = 16;
+
+    private static long checkedAdd(long left, long right, String subject) throws InvalidSlobException {
+        if (left < 0 || right < 0 || left > Long.MAX_VALUE - right) {
+            throw new InvalidSlobException("Invalid " + subject);
+        }
+        return left + right;
+    }
+
+    private static long checkedMultiply(long left, long right, String subject) throws InvalidSlobException {
+        if (left < 0 || right < 0 || (left != 0 && right > Long.MAX_VALUE / left)) {
+            throw new InvalidSlobException("Invalid " + subject);
+        }
+        return left * right;
+    }
 
 
     private Header readHeader(SlobByteChannel f) throws IOException {
