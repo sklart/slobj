@@ -108,6 +108,18 @@ public class TestSlob {
     }
 
     @Test
+    public void readsCompatibilityCorpus() throws Exception {
+        String[] fixtures = {"empty", "uncompressed", "zlib", "lzma2", "unicode", "aliases",
+                "duplicate-keys", "multiple-content-types", "fragments", "large-bin"};
+        for (String fixture : fixtures) {
+            URL resource = getClass().getClassLoader().getResource("fixtures/" + fixture + ".slob");
+            try (RandomAccessFile f = new RandomAccessFile(resource.getFile(), "r")) {
+                new Slob(f.getChannel(), fixture);
+            }
+        }
+    }
+
+    @Test
     public void unknownCompressionIsReportedWhenOpeningFile() throws Exception {
         Path path = Files.createTempFile("unknown-compression", ".slob");
         try {
