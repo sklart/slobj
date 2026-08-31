@@ -1,0 +1,24 @@
+name: Java compatibility corpus
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sklart/slob
+          path: slob-corpus
+          sparse-checkout: fixtures
+      - name: Ensure checked-in Java fixtures match slob
+        run: git diff --no-index --exit-code slob-corpus/fixtures src/test/resources/fixtures
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Run Java reader regression tests
+        run: ./gradlew test --no-daemon

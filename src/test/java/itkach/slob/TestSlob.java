@@ -1,6 +1,8 @@
 package itkach.slob;
 
 import static org.testng.AssertJUnit.assertEquals;
+import static org.testng.AssertJUnit.assertTrue;
+import static org.testng.AssertJUnit.fail;
 
 import org.testng.annotations.Test;
 
@@ -114,9 +116,48 @@ public class TestSlob {
         for (String fixture : fixtures) {
             URL resource = getClass().getClassLoader().getResource("fixtures/" + fixture + ".slob");
             try (RandomAccessFile f = new RandomAccessFile(resource.getFile(), "r")) {
-                new Slob(f.getChannel(), fixture);
+                Slob slob = new Slob(f.getChannel(), fixture);
+                for (Slob.Blob blob : slob) {
+                    assertTrue("Missing key in " + fixture, blob.key.length() > 0);
+                    assertTrue("Missing fragment in " + fixture, blob.fragment != null);
+                    assertTrue("Missing content type in " + fixture,
+                            blob.getContentType().length() > 0);
+                    Slob.Content content = blob.getContent();
+                    assertEquals(blob.getContentType(), content.type);
+                    assertTrue("Unreadable payload in " + fixture, content.data.remaining() >= 0);
+                }
             }
         }
+    }
+
+    @Test
+    public void compatibilityCorpusPreservesAliasesAndFragments() throws Exception {
+        URL aliases = getClass().getClassLoader().getResource("fixtures/aliases.slob");
+        try (RandomAccessFile f = new RandomAccessFile(aliases.getFile(), "r")) {
+            Slob slob = new Slob(f.getChannel(), "aliases");
+            assertEquals(3, slob.size());
+            assertEquals(slob.get(0).id, slob.get(1).id);
+            assertEquals(slob.get(1).id, slob.get(2).id);
+        }
+        URL fragments = getClass().getClassLoader().getResource("fixtures/fragments.slob");
+        try (RandomAccessFile f = new RandomAccessFile(fragments.getFile(), "r")) {
+            Slob slob = new Slob(f.getChannel(), "fragments");
+            assertEquals("section", slob.get(0).fragment);
+        }
+    }
+
+    @Test
+    public void corruptedCompatibilityCorpusFailsWithExpectedType() throws Exception {
+        assertCorruptedFixture("invalid-magic.slob", Slob.UnknownFileFormatException.class);
+        assertCorruptedFixture("truncated-header.slob", Slob.TruncatedFileException.class);
+        assertCorruptedFixture("truncated-ref-table.slob", Slob.TruncatedFileException.class);
+        assertCorruptedFixture("truncated-store.slob", Slob.TruncatedFileException.class);
+        assertCorruptedFixture("unknown-compression.slob", Slob.UnknownCompressionException.class);
+        assertCorruptedFixture("invalid-bin-index.slob", IndexOutOfBoundsException.class);
+        assertCorruptedFixture("invalid-item-index.slob", IndexOutOfBoundsException.class);
+        assertCorruptedFixture("invalid-content-type.slob", RuntimeException.class);
+        assertCorruptedFixture("corrupted-zlib.slob", RuntimeException.class);
+        assertCorruptedFixture("corrupted-lzma2.slob", RuntimeException.class);
     }
 
     @Test
@@ -156,6 +197,21 @@ public class TestSlob {
     private byte[] testSlobBytes() throws IOException {
         URL resource = getClass().getClassLoader().getResource("test.slob");
         return Files.readAllBytes(new java.io.File(resource.getFile()).toPath());
+    }
+
+    private void assertCorruptedFixture(String name, Class expected) throws Exception {
+        URL resource = getClass().getClassLoader().getResource("fixtures/corrupted/" + name);
+        try (RandomAccessFile f = new RandomAccessFile(resource.getFile(), "r")) {
+            Slob slob = new Slob(f.getChannel(), name);
+            for (Slob.Blob blob : slob) {
+                blob.getContentType();
+                blob.getContent();
+            }
+        } catch (Throwable error) {
+            assertTrue(name + " raised " + error.getClass().getName(), expected.isInstance(error));
+            return;
+        }
+        fail(name + " should not be readable");
     }
 
     private Path makeUncompressedCopy() throws Exception {
