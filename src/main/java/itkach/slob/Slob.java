@@ -43,9 +43,9 @@ public final class Slob extends AbstractList<Slob.Blob> {
     }
 
     /** Raised when a file declares a compression method this reader cannot handle. */
-    public final static class UnknownCompressionException extends IOException {
+    public final static class UnknownCompressionException extends UnsupportedCompressionException {
         UnknownCompressionException(String compression) {
-            super("Unsupported compression: " + compression);
+            super(compression);
         }
     }
 
@@ -289,6 +289,13 @@ public final class Slob extends AbstractList<Slob.Blob> {
 
         TruncatedFileException(){
             super("Truncated file");
+        }
+    }
+
+    public static class UnsupportedCompressionException extends IOException {
+
+        UnsupportedCompressionException(String compression){
+            super("Unsupported compression: " + compression);
         }
     }
 
@@ -863,6 +870,7 @@ public final class Slob extends AbstractList<Slob.Blob> {
                 || this.header.storeOffset >= this.header.size || this.header.refsOffset >= this.header.size) {
             throw new InvalidSlobException("Invalid store or refs offset");
         }
+        // Reject unsupported compression at open time, before reading content.
         Compressor compressor = COMPRESSORS.get(header.compression);
         if (compressor == null) {
             throw new UnknownCompressionException(header.compression);
